@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const admin = require('firebase-admin');
 
 const app = express();
 app.use(cors());
@@ -13,26 +12,6 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// Configurar Firebase Admin
-let firebaseInitialized = false;
-try {
-  if (!admin.apps.length && process.env.FIREBASE_PRIVATE_KEY) {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: "gpt-engineer-390607",
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-      })
-    });
-    firebaseInitialized = true;
-    console.log('✅ Firebase Admin inicializado');
-  }
-} catch (error) {
-  console.error('❌ Erro ao inicializar Firebase:', error.message);
-}
-
-const db = firebaseInitialized ? admin.firestore() : null;
-
 // ==================== ENDPOINTS ====================
 
 // Health check
@@ -41,7 +20,6 @@ app.get('/', (req, res) => {
     status: 'ok', 
     message: 'Lovable Proxy Server',
     timestamp: new Date().toISOString(),
-    firebase: firebaseInitialized ? 'connected' : 'not configured',
     supabase: 'connected'
   });
 });
@@ -50,7 +28,6 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    firebase: firebaseInitialized,
     supabase: true
   });
 });
@@ -146,12 +123,20 @@ app.post('/api/send-message', async (req, res) => {
   try {
     const { licenseKey, token, projectId, message, files } = req.body;
     
-    console.log('📤 Enviando mensagem para projeto:', projectId);
+    console.log('[SERVER] 📤 Enviando mensagem para projeto:', projectId);
+    console.log('[SERVER] Mensagem:', message);
     
     if (!licenseKey || !projectId || !message) {
       return res.json({
         success: false,
         error: 'Dados incompletos'
+      });
+    }
+    
+    if (!token) {
+      return res.json({
+        success: false,
+        error: 'Token não fornecido'
       });
     }
     
@@ -163,7 +148,7 @@ app.post('/api/send-message', async (req, res) => {
       .single();
     
     if (licenseError || !license) {
-      console.error('❌ Licença não encontrada:', licenseKey);
+      console.error('[SERVER] ❌ Licença não encontrada:', licenseKey);
       return res.json({
         success: false,
         error: 'Licença inválida'
@@ -185,34 +170,49 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
     
-    // 3. Verificar se Firebase está configurado
-    if (!firebaseInitialized || !db) {
-      return res.json({
-        success: false,
-        error: 'Firebase não configurado. Configure as variáveis de ambiente FIREBASE_CLIENT_EMAIL e FIREBASE_PRIVATE_KEY'
-      });
-    }
+    // 3. Enviar mensagem para Firestore usando REST API com token do usuário
+    const firestoreUrl = `https://firestore.googleapis.com/v1/projects/gpt-engineer-390607/databases/(default)/documents/projects/${projectId}/messages`;
     
-    // 4. Enviar mensagem para Firestore
     const messageData = {
-      content: message,
-      role: 'user',
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
+      fields: {
+        content: { stringValue: message },
+        role: { stringValue: 'user' },
+        timestamp: { timestampValue: new Date().toISOString() }
+      }
     };
     
     if (files && files.length > 0) {
-      messageData.files = files;
+      messageData.fields.files = {
+        arrayValue: {
+          values: files.map(f => ({ stringValue: f }))
+        }
+      };
     }
     
-    const result = await db
-      .collection('projects')
-      .doc(projectId)
-      .collection('messages')
-      .add(messageData);
+    console.log('[SERVER] 🌐 Enviando para Firestore...');
+    console.log('[SERVER] URL:', firestoreUrl);
     
-    console.log('✅ Mensagem enviada:', result.id);
+    const firestoreResponse = await fetch(firestoreUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(messageData)
+    });
     
-    // 5. Descontar crédito
+    console.log('[SERVER] 📥 Status Firestore:', firestoreResponse.status);
+    
+    if (!firestoreResponse.ok) {
+      const errorText = await firestoreResponse.text();
+      console.error('[SERVER] ❌ Erro Firestore:', errorText);
+      throw new Error(`Firestore error: ${firestoreResponse.status} - ${errorText}`);
+    }
+    
+    const result = await firestoreResponse.json();
+    console.log('[SERVER] ✅ Mensagem enviada!', result.name);
+    
+    // 4. Descontar crédito
     const { error: updateError } = await supabase
       .from('licenses')
       .update({ 
@@ -222,10 +222,10 @@ app.post('/api/send-message', async (req, res) => {
       .eq('license_key', licenseKey);
     
     if (updateError) {
-      console.error('❌ Erro ao descontar crédito:', updateError);
+      console.error('[SERVER] ❌ Erro ao descontar crédito:', updateError);
     }
     
-    // 6. Registrar uso
+    // 5. Registrar uso
     const { error: logError } = await supabase
       .from('usage_logs')
       .insert({
@@ -235,17 +235,17 @@ app.post('/api/send-message', async (req, res) => {
       });
     
     if (logError) {
-      console.error('❌ Erro ao registrar log:', logError);
+      console.error('[SERVER] ❌ Erro ao registrar log:', logError);
     }
     
     res.json({
       success: true,
-      messageId: result.id,
+      messageId: result.name,
       creditsRemaining: license.credits - 1
     });
     
   } catch (error) {
-    console.error('❌ Erro ao enviar mensagem:', error);
+    console.error('[SERVER] ❌ Erro ao enviar mensagem:', error);
     res.status(500).json({
       success: false,
       error: error.message
